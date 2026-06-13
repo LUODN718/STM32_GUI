@@ -1,329 +1,381 @@
-"""
-STM32F746G-DISCO 串口通信工具
-
-依赖安装（建议使用虚拟环境）：
-    pip install PySide6 pyserial
-"""
-import sys
-import datetime
-
+import sys, datetime, struct, time
+from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QPixmap
 from PySide6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-    QFileDialog,
+    QApplication, QComboBox, QHBoxLayout, QLabel,
+    QMainWindow, QMessageBox, QPushButton, QTextEdit, QVBoxLayout,
+    QWidget, QFileDialog, QGroupBox, QGridLayout,
 )
-
 import serial
 from serial import SerialException
 from serial.tools import list_ports
-
 from PIL import Image
-import struct
 
+IMG_W, IMG_H, IMG_CH = 80, 80, 3
+IMG_SIZE = IMG_W * IMG_H * IMG_CH
+HEADER = b'\xaa\xbb'
+RESP_MAGIC = b'\xcc\xdd'
+IMG_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif'}
 
-class SerialMonitorWindow(QMainWindow):
-    """STM32F746G-DISCO 串口通信 GUI 主窗口。"""
+def checksum(data):
+    c = 0
+    for b in data: c ^= b
+    return c & 0xFFFF
 
-    def __init__(self) -> None:
+def preprocess(path):
+    img = Image.open(path).convert('RGB')
+    img = img.resize((IMG_W, IMG_H), Image.BILINEAR)
+    raw = img.tobytes()
+    data = bytearray(IMG_SIZE)
+    for i in range(IMG_SIZE):
+        data[i] = (raw[i] - 128) & 0xFF
+    return bytes(data)
+
+def packet(data):
+    c = checksum(data)
+    return HEADER + data + struct.pack('<H', c)
+
+def parse_resp(buf):
+    if len(buf) < 4 or buf[2:4] != RESP_MAGIC: return None
+    return {'ps': buf[0]-128, 'ns': buf[1]-128, 'det': buf[0] <= buf[1]}
+
+class MainWindow(QMainWindow):
+    def __init__(self):
         super().__init__()
-
-        self.serial_port: serial.Serial | None = None
-        self.is_connected = False  # 串口连接状态标记
-        self.baud_rate = 115200    # STM32F746默认波特率（匹配硬件）
-
-        self.setWindowTitle("STM32F746G-DISCO 串口通信工具")
-        self.resize(600, 400)
-
-        self._init_ui()
-        self._init_timer()
+        self.sp = None
+        self.conn = False
+        self.baud = 921600
+        self.rbuf = bytearray()
+        self.folder_imgs = []
+        self.folder_idx = 0
+        self.loop_data = None
+        self.stats = {'person': 0, 'no_person': 0, 'err': 0}
+        self._cap = None
+        self._stimer = None
+        self._mode = None
+        self.setWindowTitle('TinyEngine VWW - Person Detection')
+        self.resize(620, 520)
+        self._ui()
+        self._rt = QTimer(self)
+        self._rt.setInterval(50)
+        self._rt.timeout.connect(self._read)
         self.refresh_ports()
 
-    # ---------- UI 初始化 ----------
-    def _init_ui(self) -> None:
-        """初始化界面布局和控件。"""
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
+    def _ui(self):
+        cw = QWidget(self); self.setCentralWidget(cw)
+        lo = QVBoxLayout(); cw.setLayout(lo)
 
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        h1 = QHBoxLayout()
+        h1.addWidget(QLabel('[Serial]'))
+        self.pcb = QComboBox(); self.pcb.setMinimumWidth(150)
+        h1.addWidget(self.pcb, 1)
+        h1.addWidget(QLabel('Baud:'))
+        self.bcb = QComboBox()
+        self.bcb.addItems(['921600','460800','115200'])
+        self.bcb.setCurrentText('921600')
+        h1.addWidget(self.bcb)
+        self.rbtn = QPushButton('Refresh')
+        self.cbtn = QPushButton('Connect')
+        self.lbtn = QPushButton('Clear')
+        h1.addWidget(self.rbtn); h1.addWidget(self.cbtn); h1.addWidget(self.lbtn)
+        lo.addLayout(h1)
 
-        # 顶部栏：串口选择 + 刷新 + 连接/断开 + 清屏
-        top_layout = QHBoxLayout()
+        g1 = QGroupBox('Image Sender')
+        gl = QVBoxLayout(); g1.setLayout(gl)
+        r2 = QHBoxLayout()
+        self.ilbl = QLabel('No image selected')
+        self.ilbl.setStyleSheet('color: gray;')
+        self.selbtn = QPushButton('Select Image')
+        self.sendbtn = QPushButton('Send to MCU')
+        self.sendbtn.setStyleSheet('font-weight: bold;')
+        r2.addWidget(self.ilbl, 1); r2.addWidget(self.selbtn); r2.addWidget(self.sendbtn)
+        gl.addLayout(r2)
+        r3 = QHBoxLayout()
+        self.fbtn = QPushButton('Send Folder')
+        self.cambtn = QPushButton('Camera')
+        self.loopbtn = QPushButton('Loop Test')
+        self.stopbtn = QPushButton('Stop')
+        self.stopbtn.setEnabled(False)
+        self.stopbtn.setStyleSheet('color: #c62828; font-weight: bold;')
+        r3.addWidget(self.fbtn); r3.addWidget(self.cambtn)
+        r3.addWidget(self.loopbtn); r3.addWidget(self.stopbtn)
+        r3.addStretch(); gl.addLayout(r3); lo.addWidget(g1)
 
-        port_label = QLabel("串口:")
-        self.port_combo = QComboBox()
-        self.refresh_button = QPushButton("refresh")
-        self.connect_button = QPushButton("connect")
-        self.clear_log_button = QPushButton("清屏")
+        g2 = QGroupBox('Inference Result')
+        gl2 = QGridLayout(); g2.setLayout(gl2)
+        self.rlbl = QLabel('Waiting for image...')
+        self.rlbl.setAlignment(Qt.AlignCenter)
+        self.rlbl.setStyleSheet('font-size: 20px; font-weight: bold; padding: 8px;')
+        gl2.addWidget(self.rlbl, 0, 0, 1, 2)
+        gl2.addWidget(QLabel('Person score:'), 1, 0)
+        self.psl = QLabel('--'); gl2.addWidget(self.psl, 1, 1)
+        gl2.addWidget(QLabel('No-person score:'), 2, 0)
+        self.nsl = QLabel('--'); gl2.addWidget(self.nsl, 2, 1)
+        self.stl = QLabel('Person: 0 | No Person: 0 | Errors: 0')
+        self.stl.setStyleSheet('color: #666; font-size: 10px;')
+        gl2.addWidget(self.stl, 3, 0, 1, 2)
+        lo.addWidget(g2)
 
-        top_layout.addWidget(port_label)
-        top_layout.addWidget(self.port_combo, stretch=1)
-        top_layout.addWidget(self.refresh_button)
-        top_layout.addWidget(self.connect_button)
-        top_layout.addWidget(self.clear_log_button)
+        self.prev = QLabel()
+        self.prev.setFixedSize(160, 160)
+        self.prev.setAlignment(Qt.AlignCenter)
+        self.prev.setStyleSheet('border: 1px solid #bbb; background: #f5f5f5;')
+        self.prev.setText('Preview')
+        lo.addWidget(self.prev)
 
-        # 中间：日志显示区
-        self.log_edit = QTextEdit()
-        self.log_edit.setReadOnly(True)
-        # 设置日志区字体和颜色（提升可读性）
-        self.log_edit.setStyleSheet("font-family: Consolas; font-size: 12px;")
+        g3 = QGroupBox('Log')
+        gl3 = QVBoxLayout(); g3.setLayout(gl3)
+        self.log = QTextEdit(); self.log.setReadOnly(True)
+        self.log.setMaximumHeight(90)
+        self.log.setStyleSheet('font-family: Consolas; font-size: 10px;')
+        gl3.addWidget(self.log)
+        lo.addWidget(g3)
 
-        # 图片发送区域
-        image_layout = QHBoxLayout()
-        self.image_path_label = QLabel("未选择图片")
-        self.select_image_button = QPushButton("选择图片")
-        self.send_image_button = QPushButton("发送图片")
+        self.rbtn.clicked.connect(self.refresh_ports)
+        self.cbtn.clicked.connect(self._toggle)
+        self.lbtn.clicked.connect(lambda: self.log.clear())
+        self.bcb.currentTextChanged.connect(lambda t: setattr(self, 'baud', int(t)))
+        self.selbtn.clicked.connect(self._sel_img)
+        self.sendbtn.clicked.connect(self._send_one)
+        self.fbtn.clicked.connect(self._start_folder)
+        self.cambtn.clicked.connect(self._start_cam)
+        self.loopbtn.clicked.connect(self._start_loop)
+        self.stopbtn.clicked.connect(self._stop)
 
-        image_layout.addWidget(self.image_path_label, stretch=1)
-        image_layout.addWidget(self.select_image_button)
-        image_layout.addWidget(self.send_image_button)
+    def refresh_ports(self):
+        self.pcb.clear()
+        for p in list_ports.comports():
+            self.pcb.addItem(f'{p.device} - {p.description}', p.device)
 
-        # 底部栏：输入框 + 发送
-        bottom_layout = QHBoxLayout()
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("输入指令，按回车或点击发送（自动添加换行）")
-        self.send_button = QPushButton("发送")
-
-        bottom_layout.addWidget(self.input_edit, stretch=1)
-        bottom_layout.addWidget(self.send_button)
-
-        # 组合布局
-        main_layout.addLayout(top_layout)
-        main_layout.addWidget(self.log_edit, stretch=1)
-        main_layout.addLayout(image_layout)
-        main_layout.addLayout(bottom_layout)
-
-        # 信号连接
-        self.refresh_button.clicked.connect(self.refresh_ports)
-        self.connect_button.clicked.connect(self.toggle_connection)
-        self.send_button.clicked.connect(self.send_command)
-        self.input_edit.returnPressed.connect(self.send_command)
-
-        self.clear_log_button.clicked.connect(self.clear_log)
-
-        self.select_image_button.clicked.connect(self.choose_image_file)
-        self.send_image_button.clicked.connect(self.send_image_to_mcu)
-
-    # ---------- 定时器初始化（非阻塞读串口） ----------
-    def _init_timer(self) -> None:
-        """初始化串口读取定时器（避免UI卡顿）。"""
-        self.read_timer = QTimer(self)
-        self.read_timer.setInterval(100)  # 100ms读取一次串口（平衡实时性和性能）
-        self.read_timer.timeout.connect(self.read_serial_data)
-
-    # ---------- 串口相关功能 ----------
-    def refresh_ports(self) -> None:
-        """刷新可用串口列表（适配Windows系统）。"""
-        self.port_combo.clear()
-        try:
-            # 枚举所有串口，显示「COM口 - 设备描述」（方便识别STM32）
-            ports = list_ports.comports()
-            if not ports:
-                self.port_combo.addItem("无可用串口")
-                self.append_log("提示：未检测到任何串口设备")
+    def _toggle(self):
+        if self.conn:
+            self._stop(); self._rt.stop()
+            if self.sp:
+                try: self.sp.close()
+                except: pass
+                self.sp = None
+            self.conn = False; self.cbtn.setText('Connect')
+            self._log('Disconnected')
+        else:
+            pn = self.pcb.currentData()
+            if not pn:
+                QMessageBox.warning(self, 'Warning', 'Select a serial port first.')
                 return
+            try:
+                self.sp = serial.Serial(pn, self.baud, timeout=0.1)
+                time.sleep(0.3)
+                self.conn = True; self.cbtn.setText('Disconnect')
+                self._rt.start()
+                self._log(f'Connected {pn} @ {self.baud}')
+            except SerialException as e:
+                self._log(f'Error: {e}', err=True)
+                QMessageBox.critical(self, 'Error', str(e))
 
-            for port in ports:
-                port_info = f"{port.device} - {port.description}"
-                self.port_combo.addItem(port_info, port.device)  # 存储纯COM口名到数据区
-        except Exception as e:
-            self.append_log(f"刷新串口失败：{str(e)}", is_error=True)
+    def _read(self):
+        if not self.conn or not self.sp: return
+        try:
+            while self.sp.in_waiting > 0:
+                self.rbuf.extend(self.sp.read(self.sp.in_waiting))
+                while len(self.rbuf) >= 4:
+                    r = parse_resp(bytes(self.rbuf[:4]))
+                    if r:
+                        self._on_result(r)
+                        self.rbuf = self.rbuf[4:]
+                    else:
+                        self.rbuf = self.rbuf[1:]
+                if len(self.rbuf) > 512:
+                    self.rbuf = bytearray()
+        except SerialException as e:
+            self._log(f'Read error: {e}', err=True)
+            self._toggle()
 
-    def toggle_connection(self) -> None:
-        """切换串口连接/断开状态。"""
-        if self.is_connected:
-            # 断开串口
-            self._disconnect_serial()
+    def _on_result(self, r):
+        label = 'PERSON' if r['det'] else 'NO PERSON'
+        color = '#c62828' if r['det'] else '#2e7d32'
+        bg = '#ffcdd2' if r['det'] else '#c8e6c9'
+        key = 'person' if r['det'] else 'no_person'
+        self.stats[key] += 1
+        self.stl.setText(f"Person: {self.stats['person']} | No Person: {self.stats['no_person']} | Errors: {self.stats['err']}")
+        self.rlbl.setText(label)
+        self.rlbl.setStyleSheet(f'font-size: 24px; font-weight: bold; padding: 8px; color: {color}; background: {bg}; border-radius: 6px;')
+        self.psl.setText(str(r['ps']))
+        self.nsl.setText(str(r['ns']))
+        self._log(f'>>> {label} | person={r["ps"]} no_person={r["ns"]}')
+
+    def _sel_img(self):
+        p, _ = QFileDialog.getOpenFileName(self, 'Select Image', '', 'Images (*.png *.jpg *.jpeg *.bmp *.gif)')
+        if p:
+            self.ilbl.setText(p)
+            self.ilbl.setStyleSheet('color: black;')
+            self.loop_data = None
+            try:
+                pix = QPixmap(p).scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.prev.setPixmap(pix)
+            except:
+                pass
+
+    def _check(self):
+        if not self.conn or not self.sp:
+            QMessageBox.warning(self, 'Warning', 'Connect serial port first.')
+            return False
+        return True
+
+    def _send_one(self):
+        if not self._check(): return
+        p = self.ilbl.text()
+        if not p or p == 'No image selected':
+            QMessageBox.warning(self, 'Warning', 'Select an image first.')
+            return
+        data = self._load(p)
+        if data:
+            self._write(data)
+            self._log(f'Sent: {Path(p).name}')
+
+    def _start_folder(self):
+        if not self._check(): return
+        folder = QFileDialog.getExistingDirectory(self, 'Select Image Folder')
+        if not folder: return
+        self.folder_imgs = sorted([str(p) for p in Path(folder).iterdir() if p.suffix.lower() in IMG_EXTS])
+        if not self.folder_imgs:
+            QMessageBox.warning(self, 'Warning', 'No images found in folder.')
+            return
+        self.folder_idx = 0
+        self.stats = {'person': 0, 'no_person': 0, 'err': 0}
+        self.stl.setText('Person: 0 | No Person: 0 | Errors: 0')
+        self._log(f'=== Folder mode: {len(self.folder_imgs)} images ===')
+        self._set_run('folder')
+        self._stimer = QTimer(self)
+        self._stimer.timeout.connect(self._folder_tick)
+        self._stimer.start(600)
+        self._folder_tick()
+
+    def _folder_tick(self):
+        if self.folder_idx >= len(self.folder_imgs):
+            self._stop()
+            self._log(f'=== Done! Person: {self.stats["person"]}, No Person: {self.stats["no_person"]}, Errors: {self.stats["err"]} ===')
+            return
+        p = self.folder_imgs[self.folder_idx]
+        self.folder_idx += 1
+        data = self._load(p)
+        if data:
+            self._write(data)
+            self._log(f'[{self.folder_idx}/{len(self.folder_imgs)}] {Path(p).name}')
         else:
-            # 连接串口
-            self._connect_serial()
+            self.stats['err'] += 1
 
-    def _connect_serial(self) -> None:
-        """建立串口连接（核心逻辑）。"""
-        # 检查是否选中有效串口
-        if self.port_combo.currentIndex() < 0 or self.port_combo.currentText() == "无可用串口":
-            QMessageBox.warning(self, "警告", "请选择有效的串口！")
+    def _start_loop(self):
+        if not self._check(): return
+        p = self.ilbl.text()
+        if not p or p == 'No image selected':
+            QMessageBox.warning(self, 'Warning', 'Select an image first.')
             return
+        data = self._load(p)
+        if not data: return
+        self.loop_data = data
+        self.stats = {'person': 0, 'no_person': 0, 'err': 0}
+        self.stl.setText('Person: 0 | No Person: 0 | Errors: 0')
+        self._log(f'=== Loop mode: {Path(p).name} ===')
+        self._set_run('loop')
+        self._stimer = QTimer(self)
+        self._stimer.timeout.connect(self._loop_tick)
+        self._stimer.start(600)
+        self._loop_tick()
 
-        # 获取选中的COM口（纯设备名，如COM5）
-        selected_port = self.port_combo.currentData()
-        if not selected_port:
-            selected_port = self.port_combo.currentText().split(" - ")[0]  # 兼容无数据的情况
+    def _loop_tick(self):
+        if self.loop_data:
+            self._write(self.loop_data)
 
+    def _start_cam(self):
+        if not self._check(): return
         try:
-            # 打开串口（timeout=0 非阻塞模式）
-            self.serial_port = serial.Serial(
-                port=selected_port,
-                baudrate=self.baud_rate,
-                bytesize=8,
-                parity="N",
-                stopbits=1,
-                timeout=0
-            )
-            self.is_connected = True
-            self.connect_button.setText("断开")
-            self.read_timer.start()  # 启动定时器，开始读取串口数据
-            self.append_log(f"成功连接：{selected_port} (波特率：{self.baud_rate})")
-        except SerialException as e:
-            # 捕获串口异常（被占用、不存在等）
-            self.append_log(f"连接失败：{str(e)}", is_error=True)
-            QMessageBox.critical(self, "错误", f"串口连接失败：{str(e)}")
-
-    def _disconnect_serial(self) -> None:
-        """断开串口连接。"""
-        if self.serial_port and self.serial_port.is_open:
-            self.serial_port.close()
-        self.read_timer.stop()  # 停止定时器
-        self.is_connected = False
-        self.connect_button.setText("连接")
-        self.append_log("已断开串口连接")
-
-    # ---------- 数据收发功能 ----------
-    def send_command(self) -> None:
-        """发送指令到STM32（自动添加换行符）。"""
-        if not self.is_connected:
-            QMessageBox.warning(self, "警告", "请先连接串口！")
+            import cv2, numpy as np
+        except ImportError:
+            QMessageBox.critical(self, 'Error', 'Camera needs: pip install opencv-python')
             return
-
-        # 获取输入框内容并去空
-        command = self.input_edit.text().strip()
-        if not command:
+        self._cap = cv2.VideoCapture(0)
+        if not self._cap.isOpened():
+            QMessageBox.critical(self, 'Error', 'Cannot open camera.')
             return
+        self.stats = {'person': 0, 'no_person': 0, 'err': 0}
+        self.stl.setText('Person: 0 | No Person: 0 | Errors: 0')
+        self._log('=== Camera mode ===')
+        self._set_run('camera')
+        self._stimer = QTimer(self)
+        self._stimer.timeout.connect(self._cam_tick)
+        self._stimer.start(250)
 
+    def _cam_tick(self):
+        import cv2, numpy as np
+        ret, frame = self._cap.read()
+        if not ret: return
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (IMG_W, IMG_H))
+        d = img.astype(np.int16) - 128
+        self._write(d.astype(np.int8).tobytes())
+
+    def _stop(self):
+        if self._stimer:
+            self._stimer.stop()
+            self._stimer = None
+        if self._cap:
+            try:
+                self._cap.release()
+                import cv2; cv2.destroyAllWindows()
+            except: pass
+            self._cap = None
+        self._mode = None
+        self._set_run(None)
+
+    def _set_run(self, mode):
+        running = mode is not None
+        self._mode = mode
+        self.fbtn.setEnabled(not running)
+        self.cambtn.setEnabled(not running)
+        self.loopbtn.setEnabled(not running)
+        self.sendbtn.setEnabled(not running)
+        self.stopbtn.setEnabled(running)
+        self.stopbtn.setText(f'Stop [{mode}]' if mode else 'Stop')
+
+    def _load(self, path):
         try:
-            # 发送数据（添加\n结尾，匹配STM32按行解析的习惯）
-            send_data = (command + "\n").encode("utf-8")
-            self.serial_port.write(send_data)
-            self.append_log(f"TX: {command}")
-            self.input_edit.clear()  # 清空输入框
-        except SerialException as e:
-            self.append_log(f"发送失败：{str(e)}", is_error=True)
-            self._disconnect_serial()  # 发送失败自动断开
-
-    def read_serial_data(self) -> None:
-        """读取STM32发来的串口数据（定时器触发）。"""
-        if not self.is_connected or not self.serial_port:
-            return
-
-        try:
-            # 读取所有可用数据（按行解析）
-            while self.serial_port.in_waiting > 0:
-                # 读取一行数据，忽略编码错误，去除换行符
-                data = self.serial_port.readline().decode("utf-8", errors="ignore").rstrip("\r\n")
-                if data:  # 仅显示非空数据
-                    self.append_log(f"RX: {data}")
-        except SerialException as e:
-            self.append_log(f"读取数据失败：{str(e)}", is_error=True)
-            self._disconnect_serial()  # 读取失败自动断开
-
-    # ---------- 日志辅助功能 ----------
-    def append_log(self, text: str, is_error: bool = False) -> None:
-        """添加日志到显示区（带时间戳，错误标红）。"""
-        # 生成时间戳（格式：YYYY-MM-DD HH:MM:SS）
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 日志格式：[时间] 内容
-        log_text = f"[{timestamp}] {text}"
-
-        # 错误日志标红，普通日志默认颜色
-        self.log_edit.moveCursor(QTextCursor.End)
-        if is_error:
-            self.log_edit.setTextColor(Qt.red)
-        else:
-            self.log_edit.setTextColor(Qt.black)
-        self.log_edit.insertPlainText(log_text + "\n")
-        # 恢复默认颜色，避免后续日志继承红色
-        self.log_edit.setTextColor(Qt.black)
-        # 自动滚动到最新日志
-        self.log_edit.ensureCursorVisible()
-
-    def clear_log(self) -> None:
-        """清空日志显示区。"""
-        self.log_edit.clear()
-
-    # ---------- 图片发送相关 ----------
-    def choose_image_file(self) -> None:
-        """选择图片文件。"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择图片文件",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp)",
-        )
-        if file_path:
-            self.image_path_label.setText(file_path)
-
-    def send_image_to_mcu(self) -> None:
-        """将选择的图片转换为数组并通过串口发送。"""
-        if not self.is_connected or not self.serial_port:
-            QMessageBox.warning(self, "警告", "请先连接串口！")
-            return
-
-        image_path = self.image_path_label.text()
-        if not image_path or image_path == "未选择图片":
-            QMessageBox.warning(self, "警告", "请先选择图片！")
-            return
-
-        try:
-            # 1. 读入图片并转换为灰度，缩放到合适分辨率（示例：128x128）
-            target_width, target_height = 128, 128
-            img = Image.open(image_path).convert("L")
-            img = img.resize((target_width, target_height))
-
-            # 2. 转为一维字节数组（每像素 1 字节）
-            pixel_bytes = img.tobytes()
-
-            # 3. 构造简单协议头
-            # [2字节 固定帧头 0x55AA]
-            # [2字节 宽度]
-            # [2字节 高度]
-            # [4字节 数据长度]
-            header = struct.pack(
-                "<H H H I",
-                0x55AA,
-                target_width,
-                target_height,
-                len(pixel_bytes),
-            )
-
-            # 4. 发送
-            self.serial_port.write(header)
-            self.serial_port.write(pixel_bytes)
-            self.serial_port.flush()
-
-            self.append_log(
-                f"已发送图片：{image_path}，尺寸 {target_width}x{target_height}，字节数 {len(pixel_bytes)}"
-            )
+            return preprocess(path)
         except Exception as e:
-            self.append_log(f"发送图片失败：{str(e)}", is_error=True)
-            QMessageBox.critical(self, "错误", f"发送图片失败：{str(e)}")
+            self._log(f'Load error: {e}', err=True)
+            self.stats['err'] += 1
+            return None
 
-    # ---------- 窗口关闭时清理资源 ----------
-    def closeEvent(self, event) -> None:
-        """窗口关闭时自动断开串口，释放资源。"""
-        if self.is_connected:
-            self._disconnect_serial()
-        event.accept()
+    def _write(self, data):
+        if self.sp:
+            try:
+                self.sp.write(packet(data))
+                self.sp.flush()
+            except SerialException as e:
+                self._log(f'Write error: {e}', err=True)
 
+    def _log(self, s, err=False):
+        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        self.log.moveCursor(QTextCursor.End)
+        self.log.setTextColor(Qt.red if err else Qt.black)
+        self.log.insertPlainText(f'[{ts}] {s}\n')
+        self.log.setTextColor(Qt.black)
+        self.log.ensureCursorVisible()
 
-# ---------- 程序入口 ----------
-def main() -> None:
+    def closeEvent(self, e):
+        self._stop()
+        if self.conn:
+            self._rt.stop()
+            if self.sp:
+                try: self.sp.close()
+                except: pass
+        e.accept()
+
+def main():
     app = QApplication(sys.argv)
-    window = SerialMonitorWindow()
-    window.show()
+    app.setStyle('Fusion')
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
