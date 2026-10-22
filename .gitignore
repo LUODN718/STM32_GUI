@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# IDE 个人配置
+.idea/workspace.xml
+
+# 打包产物与本地备份
+build/
+dist/
+*.spec
+backups/
