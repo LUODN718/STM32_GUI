@@ -18,6 +18,9 @@ class FakeSerial:
         self.rx = bytearray()
         self.writes = []
         self.closed = False
+        self.dtr = None
+        self.rts = None
+        self.open_state = None
 
     @property
     def in_waiting(self):
@@ -30,6 +33,9 @@ class FakeSerial:
 
     def reset_input_buffer(self):
         self.rx.clear()
+
+    def open(self):
+        self.open_state = (self.dtr, self.rts)
 
     def write(self, data):
         self.writes.append(data)
@@ -107,8 +113,18 @@ class WorkbenchTest(unittest.TestCase):
         self.assertEqual(self.window.stats['err'], 1)
         self.assertEqual(self.window.history, [])
 
+    def test_serial_open_keeps_reset_lines_inactive(self):
+        self.window.pcb.addItem('mock serial', '/dev/cu.mock')
+        self.window.pcb.setCurrentIndex(self.window.pcb.count() - 1)
+        self.window.conn = False
+        with patch.object(main.serial, 'Serial', return_value=self.serial):
+            self.window._toggle()
+        self.assertEqual(self.serial.open_state, (False, False))
+        self.assertEqual(self.window.baud, 921600)
+
     def test_csv_export_keeps_real_scores(self):
         self.window._send_one()
+        self.window.pending['started'] = time.monotonic() - 0.01
         self.response()
         output = Path(self.temp.name) / '结果.csv'
         with patch.object(main.QFileDialog, 'getSaveFileName', return_value=(str(output), 'CSV')):

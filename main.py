@@ -410,7 +410,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '连接设备', '请先插入开发板，再刷新串口列表。')
             return
         try:
-            self.sp = serial.Serial(port, self.baud, timeout=0, write_timeout=2)
+            # Some USB-UART bridges wire DTR/RTS to ESP32 reset/boot circuitry.
+            # Set both inactive before opening, since opening can reset the chip.
+            self.sp = serial.Serial()
+            self.sp.port = port
+            self.sp.baudrate = self.baud
+            self.sp.timeout = 0
+            self.sp.write_timeout = 2
+            self.sp.dtr = False
+            self.sp.rts = False
+            self.sp.open()
             self.sp.reset_input_buffer()
             self.rbuf.clear()
             self.conn = True
