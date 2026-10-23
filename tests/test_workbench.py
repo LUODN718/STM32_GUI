@@ -41,6 +41,9 @@ class FakeSerial:
         self.writes.append(data)
         return len(data)
 
+    def flush(self):
+        return None
+
     def close(self):
         self.closed = True
 
@@ -112,6 +115,44 @@ class WorkbenchTest(unittest.TestCase):
         self.assertIsNone(self.window._mode)
         self.assertEqual(self.window.stats['err'], 1)
         self.assertEqual(self.window.history, [])
+
+    def test_hardware_info_is_optional(self):
+        self.window._request_hardware_info()
+        self.assertEqual(self.serial.writes[-1], b'\xa5\x5a\x01')
+        self.window.info_pending = time.monotonic() - 3
+        self.window._read()
+        self.assertIsNone(self.window.info_pending)
+        self.assertTrue(any('当前固件未返回硬件信息' in message for message in self.window.log.toPlainText().splitlines()))
+        self.assertTrue(self.window.conn)
+
+    def test_structured_device_profile_lines(self):
+        self.window._request_hardware_info()
+        self.serial.rx.extend(
+            b'INFO family=ESP32 chip=ESP32-S3 cpu_mhz=240\n'
+            b'CAPS info=1 infer=1 benchmark=1\n'
+            b'MODEL name=mcunet-vww1 task=classification\n')
+        self.window._read()
+        self.assertEqual(self.window.device_profile['chip'], 'ESP32-S3')
+        self.assertEqual(self.window.device_caps['infer'], '1')
+        self.assertEqual(self.window.device_profile['model_name'], 'mcunet-vww1')
+        self.assertIsNone(self.window.info_pending)
+
+    def test_self_test_uses_builtin_frame(self):
+        self.window._start_self_test()
+        self.assertEqual(len(self.serial.writes[-1]), 19204)
+        self.assertEqual(self.serial.writes[-1][:2], b'\xaa\xbb')
+        self.assertEqual(self.window.pending['mode'], 'selftest')
+        self.response()
+        self.assertIsNone(self.window.pending)
+        self.assertTrue(any('设备自检通过' in message for message in self.window.log.toPlainText().splitlines()))
+
+    def test_benchmark_can_use_builtin_frame_without_selection(self):
+        self.window.image_path = None
+        self.window._start_benchmark()
+        self.window._stimer.stop()
+        self.window._tick()
+        self.assertEqual(len(self.serial.writes[-1]), 19204)
+        self.assertEqual(self.window.pending['mode'], 'benchmark')
 
     def test_serial_open_keeps_reset_lines_inactive(self):
         self.window.pcb.addItem('mock serial', '/dev/cu.mock')
